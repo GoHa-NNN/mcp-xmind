@@ -4,8 +4,8 @@
 // Usage: echo '{"action":"read","path":"/tmp/file.xmind"}' | node read_xmind.mjs
 // No external dependencies — uses only Node.js built-ins.
 
-import { readFileSync, readdirSync, statSync } from 'fs';
-import { resolve, join, basename, normalize } from 'path';
+import { readFileSync, readdirSync, statSync, writeFileSync, mkdirSync, unlinkSync } from 'fs';
+import { resolve, join, basename, normalize, dirname } from 'path';
 import { inflateRawSync } from 'zlib';
 
 // ─── Minimal ZIP reader (PKZIP APPNOTE 6.3.3) ───
@@ -693,6 +693,13 @@ function processNode(node, sheetTitle) {
     if (node.href) result.href = node.href;
     if (node.labels) result.labels = node.labels;
 
+    // Embedded image attached to the topic (stored in resources/ inside the .xmind ZIP)
+    if (node.image?.src) {
+        result.image = { src: node.image.src };
+        if (node.image.width != null) result.image.width = node.image.width;
+        if (node.image.height != null) result.image.height = node.image.height;
+    }
+
     if (node.children?.callout) {
         result.callouts = node.children.callout.map(c => ({ title: c.title }));
     }
@@ -1054,6 +1061,152 @@ function actionFormatInfo(input) {
     };
 }
 
+// ─── Image extraction ───
+
+// Manifest lets a later run delete files this script generated but no longer needs,
+// without ever touching unrelated files that happen to live in the same folder.
+const IMAGE_MANIFEST = '.xmind-images.json';
+
+function loadImageManifest(outputDir) {
+    try {
+        return JSON.parse(readFileSync(join(outputDir, IMAGE_MANIFEST), 'utf-8'));
+    } catch {
+        return null; // missing or unreadable manifest: nothing we can safely reclaim
+    }
+}
+
+function cleanupStaleImages(outputDir, currentFiles) {
+    const manifest = loadImageManifest(outputDir);
+    if (!manifest?.files?.length) return [];
+
+    const current = new Set(currentFiles.map(f => resolve(f)));
+    const removed = [];
+    for (const name of manifest.files) {
+        const target = resolve(outputDir, name);
+        // Safety: only delete direct children of outputDir that this script wrote earlier
+        if (dirname(target) !== outputDir) continue;
+        if (current.has(target)) continue;
+        try {
+            unlinkSync(target);
+            removed.push(target);
+        } catch { /* already gone */ }
+    }
+    return removed;
+}
+
+// Collect every image reference in a topic tree (topic image + <img> in notes HTML).
+function collectImageRefs(node, sheetTitle, parents, out) {
+    if (!node) return;
+    const nodePath = [...parents, node.title || '(untitled)'].join(' > ');
+
+    if (node.image?.src) {
+        out.push({
+            sheet: sheetTitle,
+            nodeId: node.id,
+            nodePath,
+            src: node.image.src,
+            width: node.image.width,
+            height: node.image.height,
+            source: 'topic',
+        });
+    }
+
+    if (node.notes?.html) {
+        const re = /<img\b[^>]*\bsrc\s*=\s*["']([^"']+)["'][^>]*>/gi;
+        let match;
+        while ((match = re.exec(node.notes.html)) !== null) {
+            out.push({ sheet: sheetTitle, nodeId: node.id, nodePath, src: match[1], source: 'notes' });
+        }
+    }
+
+    for (const child of node.children || []) {
+        collectImageRefs(child, sheetTitle, [...parents, node.title || '(untitled)'], out);
+    }
+}
+
+function actionExtractImages(input) {
+    if (!input.path) throw new Error('Missing "path"');
+    const filePath = resolve(input.path);
+    const zip = readZip(readFileSync(filePath));
+    const entries = new Set(zip.names());
+    const sheets = parseXMind(filePath);
+
+    const refs = [];
+    for (const sheet of sheets) {
+        const sheetTitle = sheet.sheetTitle || 'Untitled Map';
+        collectImageRefs(sheet, sheetTitle, [], refs);
+        for (const dt of sheet.detachedTopics || []) {
+            collectImageRefs(dt, sheetTitle, [], refs);
+        }
+    }
+
+    const outputDir = resolve(
+        input.outputDir || join(dirname(filePath), `${basename(filePath, '.xmind')}_images`)
+    );
+    const savedFiles = new Map(); // zip entry name -> saved file path
+    const images = [];
+    const external = [];
+    const missing = [];
+    let savedCount = 0;
+
+    for (const ref of refs) {
+        // Skip remote images — only files embedded in the .xmind can be extracted
+        if (/^(https?|file):/i.test(ref.src)) {
+            external.push(ref);
+            continue;
+        }
+        const entryName = ref.src.replace(/^xap:/, '');
+        if (!entries.has(entryName)) {
+            missing.push({ ...ref, entryName });
+            continue;
+        }
+        if (!savedFiles.has(entryName)) {
+            const data = zip.extract(entryName);
+            if (!data) {
+                missing.push({ ...ref, entryName });
+                continue;
+            }
+            mkdirSync(outputDir, { recursive: true });
+            savedCount++;
+            const outFile = join(outputDir, `${String(savedCount).padStart(2, '0')}_${basename(entryName)}`);
+            writeFileSync(outFile, data);
+            savedFiles.set(entryName, outFile);
+        }
+        images.push({ ...ref, entryName, file: savedFiles.get(entryName) });
+    }
+
+    // Reclaim files left behind by a previous export into the same folder.
+    // Only files listed in the manifest (i.e. written by this script) are eligible.
+    const clean = input.clean !== false;
+    const removedFiles = clean ? cleanupStaleImages(outputDir, images.map(img => img.file)) : [];
+
+    if (savedCount > 0) {
+        mkdirSync(outputDir, { recursive: true });
+        writeFileSync(
+            join(outputDir, IMAGE_MANIFEST),
+            JSON.stringify({
+                tool: 'read_xmind.mjs',
+                updatedAt: new Date().toISOString(),
+                files: [...new Set(images.map(img => basename(img.file)))],
+            }, null, 2) + '\n'
+        );
+    } else if (clean) {
+        // Map no longer has any image: drop the now-empty manifest as well
+        try { unlinkSync(join(outputDir, IMAGE_MANIFEST)); } catch { /* nothing to clean */ }
+    }
+
+    return {
+        path: filePath,
+        outputDir,
+        totalReferences: refs.length,
+        totalFiles: savedCount,
+        ...(removedFiles.length > 0 ? { removedFiles } : {}),
+        images,
+        ...(external.length > 0 ? { external } : {}),
+        ...(missing.length > 0 ? { missing } : {}),
+    };
+}
+
 // ─── Main ───
 
 const actions = {
@@ -1065,6 +1218,7 @@ const actions = {
     extract_node_by_id: actionExtractNodeById,
     search_nodes: actionSearchNodes,
     format_info: actionFormatInfo,
+    extract_images: actionExtractImages,
 };
 
 async function main() {

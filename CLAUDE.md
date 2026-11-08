@@ -9,6 +9,9 @@
 - Skill definition: `skills/xmind/SKILL.md`
 - Create script: `skills/xmind/scripts/create_xmind.mjs` — zero npm deps (ZIP via `zlib.deflateRawSync`)
 - Read script: `skills/xmind/scripts/read_xmind.mjs` — zero npm deps (ZIP via `zlib.inflateRawSync`)
+  - `read` returns `image: {src, width?, height?}` for topics with embedded pictures (zen `node.image`, legacy `<img>`)
+  - `extract_images` action exports embedded `resources/` pictures (topic images + `<img>` in HTML notes) to a local folder
+  - Export cleanup: `.xmind-images.json` manifest in `outputDir` tracks generated files; the next run deletes only stale manifest entries (`clean: false` disables it)
 - Build script: `scripts/build-skill.sh`
 
 ## XMind Format

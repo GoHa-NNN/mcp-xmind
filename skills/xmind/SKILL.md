@@ -45,6 +45,7 @@ This skill supports both Chinese and English. When the user makes a request, ide
 | "搜索笔记内容" / "在备注里找xxx" / "哪个节点的笔记提到了xxx" | "search in notes for..." / "find notes mentioning..." | `search_nodes` | `searchIn: ["notes"]`, `query` |
 | "搜索标签" / "找带xxx标签的" | "find nodes with label..." / "search labels" | `search_nodes` | `searchIn: ["labels"]`, `query` |
 | "搜索xxx" / "在脑图里找xxx" / "全文搜索" | "search for..." / "find in map..." | `search_nodes` | `query` (searches all fields) |
+| "导出/提取脑图里的图片" / "把图片保存出来" / "看看节点里的截图" | "extract images" / "export embedded images" / "save the pictures" | `extract_images` | `path`, `outputDir?` |
 
 ### Routing tips
 
@@ -294,6 +295,7 @@ echo '{"action": "read", "path": "/path/to/file.xmind"}' | node <skill-dir>/scri
 | `extract_node_by_id` | `path`, `nodeId` | Extract a specific node by its XMind ID |
 | `search_nodes` | `path`, `query`, `searchIn?`, `caseSensitive?`, `taskStatus?` | Advanced multi-field search |
 | `format_info` | `path` | Detect XMind format version (zen/legacy) and list internal files |
+| `extract_images` | `path`, `outputDir?`, `clean?` | Extract embedded images (topic images + images in HTML notes) to a local folder. Defaults to `<xmind-name>_images/` next to the file. `clean` defaults to `true` |
 
 ### Action details
 
@@ -302,6 +304,22 @@ echo '{"action": "read", "path": "/path/to/file.xmind"}' | node <skill-dir>/scri
 echo '{"action": "read", "path": "/path/to/file.xmind"}' | node <skill-dir>/scripts/read_xmind.mjs
 ```
 Returns an array of sheets, each with a root topic containing the full tree structure including notes, labels, markers, task status, relationships, etc.
+
+Topics with an embedded picture also carry an `image` field:
+
+```json
+{ "title": "", "image": { "src": "xap:resources/abc123.png", "width": 320, "height": 160 } }
+```
+
+A topic can legitimately have no title when it only holds a screenshot. Treat `image` as the signal that the node is not empty — do not report such nodes as "empty/undefined". To read the actual picture, run `extract_images` and open the exported file with the Read tool.
+
+**`extract_images`** — Export every embedded image referenced by topics or HTML notes:
+```bash
+echo '{"action": "extract_images", "path": "/path/to/file.xmind", "outputDir": "/tmp/pics"}' | node <skill-dir>/scripts/read_xmind.mjs
+```
+Returns `{ outputDir, totalReferences, totalFiles, images: [{ sheet, nodePath, nodeId, src, file, source }], removedFiles?, external?, missing? }`. Files are named `01_<original-hash>.png`, `02_...`, in traversal order. Remote URLs (http/https) are listed under `external` and not downloaded; broken references go under `missing`.
+
+**Cleanup (garbage collection):** each export writes a `.xmind-images.json` manifest listing the files it created. On the next export into the same folder, files recorded in that manifest but no longer produced are deleted and reported under `removedFiles` — so re-exporting after a map changes never leaves stale pictures behind. Only manifest-listed direct children of `outputDir` are eligible; unrelated files in the folder are never touched. Pass `"clean": false` to disable deletion and manifest updates. If the map has no images at all, previously generated files and the manifest are removed.
 
 **`list`** — Find .xmind files in a directory:
 ```bash
@@ -339,6 +357,7 @@ echo '{"action": "search_nodes", "path": "/path/to/file.xmind", "query": "auth",
 - **Finding content across a map**: Use `search_nodes` with appropriate `searchIn` filters
 - **Filtering tasks**: Use `search_nodes` with `taskStatus: "todo"` or `"done"`
 - **Comparing maps**: Use `read_multiple` to load several files at once
+- **Looking at screenshots stored in topics**: Use `extract_images`, then open the exported files with the Read tool
 
 ## Important rules
 
